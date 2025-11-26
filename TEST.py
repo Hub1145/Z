@@ -328,38 +328,53 @@ def phemex_request(method, path, params=None, body_dict=None):
     Handles signature generation correctly for GET and POST/PUT requests.
     """
     query_string_for_signature = ""
-    query_params_for_request = params
-
-    if params:
-        sorted_params = sorted(params.items())
-        query_string_for_signature = "&".join([f"{k}={v}" for k, v in sorted_params])
-
+    query_params_for_request = None
+    body_for_request = None
+    
+    # Determine what to sign and what to send
+    if method.upper() in ['GET', 'DELETE']:
+        if params:
+            sorted_params = sorted(params.items())
+            query_string_for_signature = "&".join([f"{k}={v}" for k, v in sorted_params])
+        query_params_for_request = params
+    elif method.upper() in ['POST', 'PUT']:
+        body_for_request = body_dict
+        # For PUT, Phemex requires signing the query string but sending data in the body
+        if method.upper() == 'PUT' and params:
+             sorted_params = sorted(params.items())
+             query_string_for_signature = "&".join([f"{k}={v}" for k, v in sorted_params])
+             # Do not send params in URL for PUT, they go in body
+             body_for_request = params if not body_dict else body_dict
+    
     url = f"{REST_API_BASE_URL}{path}"
-    if method.upper() == 'PUT' and params:
-        url += "?" + query_string_for_signature
-
     expiry_int = int(time()) + 60
-
-    signature = generate_signature(path, query_string_for_signature, expiry_int, body_dict)
-
+    
+    # Generate signature
+    signature = generate_signature(path, query_string_for_signature, expiry_int, body_for_request)
+    
     headers = {
         "x-phemex-access-token": API_KEY,
         "x-phemex-request-expiry": str(expiry_int),
         "x-phemex-request-signature": signature,
         "Content-Type": "application/json"
     }
-
+    
     try:
         req_func = getattr(requests, method.lower(), None)
         if not req_func:
-             log_message(f"Unsupported HTTP method: {method}")
-             return None
+            log_message(f"Unsupported HTTP method: {method}")
+            return None
 
         kwargs = {'headers': headers, 'timeout': 15}
-        if query_params_for_request and method.upper() in ['GET', 'DELETE']:
-             kwargs['params'] = query_params_for_request
-        elif body_dict and method.upper() in ['POST', 'PUT']:
-             kwargs['data'] = json.dumps(body_dict, separators=(',', ':'), sort_keys=True)
+        
+        if query_params_for_request:
+            kwargs['params'] = query_params_for_request
+        
+        if body_for_request:
+            kwargs['data'] = json.dumps(body_for_request, separators=(',', ':'), sort_keys=True)
+
+        # For debugging the request
+        log_message(f"Request: {method} {url} Headers: {headers} Params: {kwargs.get('params')} Body: {kwargs.get('data')}", section="DEBUG")
 
         response = req_func(url, **kwargs)
 
@@ -367,13 +382,13 @@ def phemex_request(method, path, params=None, body_dict=None):
             try:
                 json_response = response.json()
                 if json_response.get('code') != 0 and json_response.get('code') is not None:
-                     log_message(f"Phemex API returned non-zero code: {json_response.get('code')} Msg: {json_response.get('msg')} for {method} {path}")
+                    log_message(f"Phemex API returned non-zero code: {json_response.get('code')} Msg: {json_response.get('msg')} for {method} {path}")
                 return json_response
             except json.JSONDecodeError:
-                 log_message(f"Failed to decode JSON response for {method} {path}. Status: {response.status_code}, Response: {response.text[:200]}")
-                 return None
+                log_message(f"Failed to decode JSON response for {method} {path}. Status: {response.status_code}, Response: {response.text[:200]}")
+                return None
         else:
-             response.raise_for_status()
+            response.raise_for_status()
 
     except requests.exceptions.Timeout:
         log_message(f"Phemex API request timeout: {method} {path}")
@@ -395,6 +410,7 @@ def phemex_request(method, path, params=None, body_dict=None):
         traceback.print_exc()
         return None
     return None
+
 # ================================================================================
 # PRODUCT INFO AND CURRENT PRICE FETCHING
 # ================================================================================
@@ -511,63 +527,65 @@ def fetch_product_info(target_symbol):
         return False
 
 def phemex_set_leverage(symbol, leverage_val):
-    """Sets leverage for the trading symbol for linear contracts with validation/clamping.
-
-    Issues addressed:
-    - Validate leverage within product min/max (if available)
-    - Only send posSide when it's 'Long' or 'Short' (do NOT send 'Merged')
-    - Log adjustments clearly
-    """
+    """Sets leverage for the trading symbol for linear contracts with validation/clamping."""
     try:
         path = "/g-positions/leverage"
+        log_message(f"Attempting to set leverage for {symbol} to {leverage_val}x", section="LEVERAGE")
 
         # Ensure integer leverage
         try:
             lev_int = int(float(leverage_val))
-        except Exception:
-            log_message(f"Invalid leverage value provided: {leverage_val}", section="ERROR")
+            log_message(f"Leverage value converted to integer: {lev_int}", section="LEVERAGE-DEBUG")
+        except (ValueError, TypeError) as e:
+            log_message(f"Invalid leverage value provided: {leverage_val}. Error: {e}", section="ERROR")
             return False
 
         # Read product leverage bounds if available
         min_lev = PRODUCT_INFO.get('minLeverage', 1)
         max_lev = PRODUCT_INFO.get('maxLeverage', 100)
+        log_message(f"Product leverage bounds: min={min_lev}, max={max_lev}", section="LEVERAGE-DEBUG")
 
         if lev_int < min_lev:
-            log_message(f"Requested leverage {lev_int} < product min {min_lev}. Clamping to min.", section="SYSTEM")
+            log_message(f"Requested leverage {lev_int}x is below minimum {min_lev}x. Clamping to {min_lev}x.", section="LEVERAGE")
             lev_int = min_lev
-        if lev_int > max_lev:
-            log_message(f"Requested leverage {lev_int} > product max {max_lev}. Clamping to max.", section="SYSTEM")
+        elif lev_int > max_lev:
+            log_message(f"Requested leverage {lev_int}x is above maximum {max_lev}x. Clamping to {max_lev}x.", section="LEVERAGE")
             lev_int = max_lev
+        else:
+            log_message(f"Leverage {lev_int}x is within bounds.", section="LEVERAGE-DEBUG")
 
-        # Build params: posSide is required only in hedged mode if setting one side.
-        params = {
+        # Build parameters dictionary
+        params_to_send = {
             "symbol": symbol,
-            "leverage": int(lev_int)
+            "leverage": lev_int
         }
 
-        # Only include posSide if explicitly Long or Short. Do NOT send 'Merged' as posSide.
+        # Only include posSide if explicitly Long or Short. Do NOT send 'Merged'.
         if POSITION_SIDE and POSITION_SIDE.lower() in ["long", "short"]:
-            params["posSide"] = POSITION_SIDE.capitalize()
+            params_to_send["posSide"] = POSITION_SIDE.capitalize()
+            log_message(f"Including posSide='{params_to_send['posSide']}' in request.", section="LEVERAGE-DEBUG")
         else:
-            # omit posSide for merged/unified mode; log it
-            log_message(f"Not including posSide in leverage request (POSITION_SIDE='{POSITION_SIDE}')", section="SYSTEM")
+            log_message(f"POSITION_SIDE is '{POSITION_SIDE}'. Not including posSide in request.", section="LEVERAGE-DEBUG")
 
-        log_message(f"Setting leverage to {lev_int}x for {symbol} (params: {params})", section="SYSTEM")
-        response = phemex_request("PUT", path, params=params)
+        log_message(f"Final parameters for leverage request: {params_to_send}", section="LEVERAGE")
+        
+        # Make the API request
+        # For PUT, params go in the `params` argument to be signed, but are sent in the body by phemex_request
+        response = phemex_request("PUT", path, params=params_to_send)
 
         if response and response.get('code') == 0:
-            log_message(f"✓ Leverage set successfully for {symbol} -> {lev_int}x", section="SYSTEM")
+            log_message(f"✓ Leverage successfully set for {symbol} to {lev_int}x.", section="LEVERAGE")
             return True
         else:
-            # Provide extra logging for API error
-            msg = response.get('msg') if response else 'No response'
             code = response.get('code') if response else 'N/A'
-            log_message(f"Failed to set leverage for {symbol}: code={code} msg={msg}", section="ERROR")
+            msg = response.get('msg') if response else 'No response'
+            log_message(f"✗ Failed to set leverage for {symbol}. Code: {code}, Msg: {msg}", section="ERROR")
             return False
     except Exception as e:
-        log_message(f"Exception in phemex_set_leverage: {e}", section="ERROR")
+        log_message(f"An unexpected error occurred in phemex_set_leverage: {e}", section="ERROR")
+        traceback.print_exc()
         return False
-
+        
 # ================================================================================
 # ORDER PLACEMENT FUNCTIONS
 # ================================================================================
