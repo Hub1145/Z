@@ -261,6 +261,7 @@ account_info_lock = threading.Lock()
 
 # WebSocket connection
 ws = None
+ws_lock = threading.Lock()
 
 # Position tracking
 in_position = False
@@ -1183,7 +1184,7 @@ def send_auth(ws_instance):
 
         auth_msg = {
             "method": "user.auth",
-            "params": ["API", API_KEY, signature, expiry],
+            "params": ["API", API_KEY, signature, str(expiry)],
             "id": 12345
         }
 
@@ -1207,14 +1208,13 @@ def on_open(ws_instance):
         send_auth(ws_instance)
 
         # Wait for the authentication confirmation
-        if not ws_authenticated.wait(timeout=10):
+        if not ws_authenticated.wait(timeout=30):
             log_message("✗ Authentication timeout", section="ERROR")
             # Optional: try to re-authenticate or close the connection
             log_message("Retrying authentication...", section="WS")
             send_auth(ws_instance)
-            if not ws_authenticated.wait(timeout=10):
+            if not ws_authenticated.wait(timeout=30):
                 log_message("✗ Authentication failed on retry. Closing connection.", section="ERROR")
-                ws_instance.close()
                 return
 
         log_message("✓ Authentication confirmed", section="WS")
@@ -1267,7 +1267,8 @@ def on_error(ws_app, error):
     if not shutdown_flag.is_set():
         sleep(5)
         try:
-            initialize_websocket()
+            with ws_lock:
+                initialize_websocket()
         except Exception:
             pass
 
@@ -1277,7 +1278,8 @@ def on_close(ws_app, status_code, msg):
     if not shutdown_flag.is_set():
         sleep(5)
         try:
-            initialize_websocket()
+            with ws_lock:
+                initialize_websocket()
         except Exception:
             pass
 
@@ -1285,30 +1287,31 @@ def initialize_websocket():
     """Initializes and starts WebSocket connection"""
     global ws
 
-    try:
-        if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
-            try:
-                ws.close()
-                sleep(2)
-            except Exception:
-                pass
+    with ws_lock:
+        try:
+            if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
+                try:
+                    ws.close()
+                    sleep(2)
+                except Exception:
+                    pass
 
-        ws = websocket.WebSocketApp(
-            WEBSOCKET_BASE_URL,
-            on_open=on_open,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
+            ws = websocket.WebSocketApp(
+                WEBSOCKET_BASE_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
 
-        wst = threading.Thread(target=ws.run_forever, name="PhemexWS", daemon=True)
-        wst.start()
-        log_message("WebSocket thread started", section="SYSTEM")
+            wst = threading.Thread(target=ws.run_forever, name="PhemexWS", daemon=True)
+            wst.start()
+            log_message("WebSocket thread started", section="SYSTEM")
 
-        return ws
-    except Exception as e:
-        log_message(f"Exception in initialize_websocket: {e}", section="ERROR")
-        return None
+            return ws
+        except Exception as e:
+            log_message(f"Exception in initialize_websocket: {e}", section="ERROR")
+            return None
 
 def send_heartbeat():
     """Sends periodic heartbeat to keep WebSocket alive"""
@@ -1317,9 +1320,10 @@ def send_heartbeat():
     while not shutdown_flag.is_set():
         sleep(30) # CHANGE FROM 5 TO 30
         try:
-            if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
-                ping_msg = json.dumps({"method": "server.ping", "params": [], "id": 99})
-                ws.send(ping_msg)
+            with ws_lock:
+                if ws and hasattr(ws, 'sock') and ws.sock and ws.sock.connected:
+                    ping_msg = json.dumps({"method": "server.ping", "params": [], "id": 99})
+                    ws.send(ping_msg)
         except Exception:
             pass
 
@@ -2704,11 +2708,12 @@ if __name__ == "__main__":
 
                 # Check WebSocket
                 ws_connected = False
-                if ws and hasattr(ws, 'sock') and ws.sock:
-                    try:
-                        ws_connected = ws.sock.connected
-                    except Exception:
-                        pass
+                with ws_lock:
+                    if ws and hasattr(ws, 'sock') and ws.sock:
+                        try:
+                            ws_connected = ws.sock.connected
+                        except Exception:
+                            pass
 
                 if not ws_connected:
                     log_message("WARNING: WebSocket disconnected! Reconnecting...", section="SYSTEM")
@@ -2744,13 +2749,14 @@ if __name__ == "__main__":
         shutdown_flag.set()
 
         # Close WebSocket
-        if ws and hasattr(ws, 'sock') and ws.sock:
-            try:
-                log_message("Closing WebSocket connection...", section="SYSTEM")
-                ws.close()
-                sleep(1)
-            except Exception as e:
-                log_message(f"Error closing WebSocket: {e} (OK, continuing)", section="ERROR")
+        with ws_lock:
+            if ws and hasattr(ws, 'sock') and ws.sock:
+                try:
+                    log_message("Closing WebSocket connection...", section="SYSTEM")
+                    ws.close()
+                    sleep(1)
+                except Exception as e:
+                    log_message(f"Error closing WebSocket: {e} (OK, continuing)", section="ERROR")
 
         # Check current state
         with position_lock:
